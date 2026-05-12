@@ -699,6 +699,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             description: "Return structured output in the requested format.",
             input_schema: json!({
                 "type": "object",
+                "properties": {},
                 "additionalProperties": true
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -4706,6 +4707,9 @@ async fn stream_with_provider(
             ApiStreamEvent::MessageStop(_) => {
                 saw_stop = true;
                 events.push(AssistantEvent::MessageStop);
+            }
+            ApiStreamEvent::Error(error) => {
+                return Err(ApiError::Auth(error.error.message));
             }
         }
     }

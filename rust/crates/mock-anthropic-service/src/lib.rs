@@ -100,6 +100,7 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    PlaywrightNavigate,
 }
 
 impl Scenario {
@@ -117,6 +118,7 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "playwright_navigate" => Some(Self::PlaywrightNavigate),
             _ => None,
         }
     }
@@ -135,6 +137,7 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::PlaywrightNavigate => "playwright_navigate",
         }
     }
 }
@@ -465,6 +468,16 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        Scenario::PlaywrightNavigate => match latest_tool_result(request) {
+            Some((tool_output, _)) => {
+                final_text_sse(&format!("Playwright navigation complete: {tool_output}"))
+            }
+            None => tool_use_sse(
+                "toolu_playwright_nav",
+                "playwright",
+                &[r#"{"action":"navigate","url":"http://example.com"}"#],
+            ),
+        },
     }
 }
 
@@ -635,6 +648,18 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        Scenario::PlaywrightNavigate => match latest_tool_result(request) {
+            Some((tool_output, _)) => text_message_response(
+                "msg_playwright_final",
+                &format!("Playwright navigation complete: {tool_output}"),
+            ),
+            None => tool_message_response(
+                "msg_playwright_tool",
+                "toolu_playwright_nav",
+                "playwright",
+                json!({"action": "navigate", "url": "http://example.com"}),
+            ),
+        },
     }
 }
 
@@ -652,6 +677,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::PlaywrightNavigate => "req_playwright_navigate",
     }
 }
 

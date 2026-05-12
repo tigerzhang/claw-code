@@ -3989,6 +3989,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
 
 fn config_source_label(source: ConfigSource) -> &'static str {
     match source {
+        ConfigSource::Base => "builtin",
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
@@ -4123,6 +4124,7 @@ fn skill_summary_json(skill: &SkillSummary) -> Value {
 
 fn config_source_id(source: ConfigSource) -> &'static str {
     match source {
+        ConfigSource::Base => "builtin",
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
