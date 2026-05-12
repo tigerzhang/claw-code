@@ -21,12 +21,12 @@ use crate::mcp_lifecycle_hardened::{
 #[cfg(test)]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
 #[cfg(not(test))]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
+const MCP_INITIALIZE_TIMEOUT_MS: u64 = 60_000;
 
 #[cfg(test)]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
 #[cfg(not(test))]
-const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
+const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -1213,20 +1213,28 @@ impl McpStdioProcess {
     }
 
     pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
+        let mut line = String::new();
+        let bytes_read = self.stdout.read_line(&mut line).await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MCP stdio stream closed while reading",
+            ));
+        }
+
+        if !line.to_ascii_lowercase().starts_with("content-length:") {
+            // Not LSP framing, assume it's a JSON line
+            return Ok(line.into_bytes());
+        }
+
+        // LSP framing
         let mut content_length = None;
+        let mut current_line = line;
         loop {
-            let mut line = String::new();
-            let bytes_read = self.stdout.read_line(&mut line).await?;
-            if bytes_read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "MCP stdio stream closed while reading headers",
-                ));
-            }
-            if line == "\r\n" {
+            let header = current_line.trim_end_matches(['\r', '\n']);
+            if header.is_empty() {
                 break;
             }
-            let header = line.trim_end_matches(['\r', '\n']);
             if let Some((name, value)) = header.split_once(':') {
                 if name.trim().eq_ignore_ascii_case("Content-Length") {
                     let parsed = value
@@ -1235,6 +1243,15 @@ impl McpStdioProcess {
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                     content_length = Some(parsed);
                 }
+            }
+
+            current_line = String::new();
+            let bytes_read = self.stdout.read_line(&mut current_line).await?;
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MCP stdio stream closed while reading headers",
+                ));
             }
         }
 
@@ -1388,9 +1405,8 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
 }
 
 fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-    let mut framed = header.into_bytes();
-    framed.extend_from_slice(payload);
+    let mut framed = payload.to_vec();
+    framed.push(b'\n');
     framed
 }
 
