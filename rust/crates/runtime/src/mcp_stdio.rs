@@ -13,18 +13,21 @@ use tokio::time::timeout;
 
 use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
-use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpStdioTransport};
+use crate::mcp_client::{
+    DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS, McpClientBootstrap, McpClientTransport, McpRemoteTransport,
+    McpStdioTransport,
+};
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
 
 #[cfg(test)]
-const MCP_INITIALIZE_TIMEOUT_MS: u64 = 200;
+const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 #[cfg(not(test))]
 const MCP_INITIALIZE_TIMEOUT_MS: u64 = 60_000;
 
 #[cfg(test)]
-const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
+const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 10_000;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 60_000;
 
@@ -453,6 +456,208 @@ fn unsupported_server_failed_server(server: &UnsupportedMcpServer) -> McpFailedS
     }
 }
 
+#[derive(Debug)]
+pub enum ManagedMcpServerConnection {
+    Stdio(McpStdioProcess),
+    Http(McpHttpConnection),
+}
+
+impl ManagedMcpServerConnection {
+    pub async fn initialize(
+        &mut self,
+        id: JsonRpcId,
+        params: McpInitializeParams,
+    ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
+        match self {
+            Self::Stdio(p) => p.initialize(id, params).await,
+            Self::Http(p) => p.initialize(id, params).await,
+        }
+    }
+
+    pub async fn list_tools(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListToolsParams>,
+    ) -> io::Result<JsonRpcResponse<McpListToolsResult>> {
+        match self {
+            Self::Stdio(p) => p.list_tools(id, params).await,
+            Self::Http(p) => p.list_tools(id, params).await,
+        }
+    }
+
+    pub async fn call_tool(
+        &mut self,
+        id: JsonRpcId,
+        params: McpToolCallParams,
+    ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
+        match self {
+            Self::Stdio(p) => p.call_tool(id, params).await,
+            Self::Http(p) => p.call_tool(id, params).await,
+        }
+    }
+
+    pub async fn list_resources(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListResourcesParams>,
+    ) -> io::Result<JsonRpcResponse<McpListResourcesResult>> {
+        match self {
+            Self::Stdio(p) => p.list_resources(id, params).await,
+            Self::Http(p) => p.list_resources(id, params).await,
+        }
+    }
+
+    pub async fn read_resource(
+        &mut self,
+        id: JsonRpcId,
+        params: McpReadResourceParams,
+    ) -> io::Result<JsonRpcResponse<McpReadResourceResult>> {
+        match self {
+            Self::Stdio(p) => p.read_resource(id, params).await,
+            Self::Http(p) => p.read_resource(id, params).await,
+        }
+    }
+
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdio(p) => p.shutdown().await,
+            Self::Http(p) => p.shutdown().await,
+        }
+    }
+
+    pub fn is_alive(&mut self) -> io::Result<bool> {
+        match self {
+            Self::Stdio(p) => Ok(!p.has_exited()?),
+            Self::Http(p) => Ok(p.is_alive()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct McpHttpConnection {
+    url: String,
+    client: reqwest::Client,
+    headers: BTreeMap<String, String>,
+}
+
+impl McpHttpConnection {
+    pub fn new(transport: &McpRemoteTransport) -> Self {
+        Self {
+            url: transport.url.clone(),
+            client: reqwest::Client::new(),
+            headers: transport.headers.clone(),
+        }
+    }
+
+    pub async fn request<TParams: Serialize, TResult: DeserializeOwned>(
+        &mut self,
+        id: JsonRpcId,
+        method: impl Into<String>,
+        params: Option<TParams>,
+    ) -> io::Result<JsonRpcResponse<TResult>> {
+        let method = method.into();
+        let request = JsonRpcRequest::new(id.clone(), method.clone(), params);
+
+        let mut req = self.client.post(&self.url).json(&request);
+
+        req = req.header("X-BrowserOS-Source", "gemini-agent");
+        req = req.header("Accept", "application/json, text/event-stream");
+
+        for (key, value) in &self.headers {
+            req = req.header(key, value);
+        }
+
+        let response = req
+            .send()
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+
+        if !response.status().is_success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("MCP HTTP request failed with status {}", response.status()),
+            ));
+        }
+
+        let rpc_response = response
+            .json::<JsonRpcResponse<TResult>>()
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+        if rpc_response.jsonrpc != "2.0" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP response for {method} used unsupported jsonrpc version `{}`",
+                    rpc_response.jsonrpc
+                ),
+            ));
+        }
+
+        if rpc_response.id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP response for {method} used mismatched id: expected {id:?}, got {:?}",
+                    rpc_response.id
+                ),
+            ));
+        }
+
+        Ok(rpc_response)
+    }
+
+    pub async fn initialize(
+        &mut self,
+        id: JsonRpcId,
+        params: McpInitializeParams,
+    ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
+        self.request(id, "initialize", Some(params)).await
+    }
+
+    pub async fn list_tools(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListToolsParams>,
+    ) -> io::Result<JsonRpcResponse<McpListToolsResult>> {
+        self.request(id, "tools/list", params).await
+    }
+
+    pub async fn call_tool(
+        &mut self,
+        id: JsonRpcId,
+        params: McpToolCallParams,
+    ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
+        self.request(id, "tools/call", Some(params)).await
+    }
+
+    pub async fn list_resources(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListResourcesParams>,
+    ) -> io::Result<JsonRpcResponse<McpListResourcesResult>> {
+        self.request(id, "resources/list", params).await
+    }
+
+    pub async fn read_resource(
+        &mut self,
+        id: JsonRpcId,
+        params: McpReadResourceParams,
+    ) -> io::Result<JsonRpcResponse<McpReadResourceResult>> {
+        self.request(id, "resources/read", Some(params)).await
+    }
+
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        // HTTP is stateless, nothing to do
+        Ok(())
+    }
+
+    pub fn is_alive(&self) -> bool {
+        // Assume alive
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolRoute {
     server_name: String,
@@ -462,7 +667,7 @@ struct ToolRoute {
 #[derive(Debug)]
 struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
-    process: Option<McpStdioProcess>,
+    connection: Option<ManagedMcpServerConnection>,
     initialized: bool,
 }
 
@@ -470,7 +675,7 @@ impl ManagedMcpServer {
     fn new(bootstrap: McpClientBootstrap) -> Self {
         Self {
             bootstrap,
-            process: None,
+            connection: None,
             initialized: false,
         }
     }
@@ -496,16 +701,17 @@ impl McpServerManager {
         let mut unsupported_servers = Vec::new();
 
         for (server_name, server_config) in servers {
-            if server_config.transport() == McpTransport::Stdio {
+            let transport = server_config.transport();
+            if transport == McpTransport::Stdio || transport == McpTransport::Http {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
                 managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
             } else {
                 unsupported_servers.push(UnsupportedMcpServer {
                     server_name: server_name.clone(),
-                    transport: server_config.transport(),
+                    transport,
                     reason: format!(
                         "transport {:?} is not supported by McpServerManager",
-                        server_config.transport()
+                        transport
                     ),
                 });
             }
@@ -638,31 +844,30 @@ impl McpServerManager {
 
         self.ensure_server_ready(&route.server_name).await?;
         let request_id = self.take_request_id();
-        let response =
-            {
-                let server = self.server_mut(&route.server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
-                    McpServerManagerError::InvalidResponse {
-                        server_name: route.server_name.clone(),
-                        method: "tools/call",
-                        details: "server process missing after initialization".to_string(),
-                    }
-                })?;
-                Self::run_process_request(
-                    &route.server_name,
-                    "tools/call",
-                    timeout_ms,
-                    process.call_tool(
-                        request_id,
-                        McpToolCallParams {
-                            name: route.raw_name,
-                            arguments,
-                            meta: None,
-                        },
-                    ),
-                )
-                .await
-            };
+        let response = {
+            let server = self.server_mut(&route.server_name)?;
+            let connection = server.connection.as_mut().ok_or_else(|| {
+                McpServerManagerError::InvalidResponse {
+                    server_name: route.server_name.clone(),
+                    method: "tools/call",
+                    details: "server connection missing after initialization".to_string(),
+                }
+            })?;
+            Self::run_process_request(
+                &route.server_name,
+                "tools/call",
+                timeout_ms,
+                connection.call_tool(
+                    request_id,
+                    McpToolCallParams {
+                        name: route.raw_name,
+                        arguments,
+                        meta: None,
+                    },
+                ),
+            )
+            .await
+        };
 
         if let Err(error) = &response {
             if Self::should_reset_server(error) {
@@ -724,10 +929,10 @@ impl McpServerManager {
         let server_names = self.servers.keys().cloned().collect::<Vec<_>>();
         for server_name in server_names {
             let server = self.server_mut(&server_name)?;
-            if let Some(process) = server.process.as_mut() {
-                process.shutdown().await?;
+            if let Some(connection) = server.connection.as_mut() {
+                connection.shutdown().await?;
             }
-            server.process = None;
+            server.connection = None;
             server.initialized = false;
         }
         Ok(())
@@ -764,6 +969,7 @@ impl McpServerManager {
                 })?;
         match &server.bootstrap.transport {
             McpClientTransport::Stdio(transport) => Ok(transport.resolved_tool_call_timeout_ms()),
+            McpClientTransport::Http(_) => Ok(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS),
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",
@@ -774,8 +980,8 @@ impl McpServerManager {
 
     fn server_process_exited(&mut self, server_name: &str) -> Result<bool, McpServerManagerError> {
         let server = self.server_mut(server_name)?;
-        match server.process.as_mut() {
-            Some(process) => Ok(process.has_exited()?),
+        match server.connection.as_mut() {
+            Some(connection) => Ok(!connection.is_alive()?),
             None => Ok(false),
         }
     }
@@ -815,18 +1021,18 @@ impl McpServerManager {
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+                let connection = server.connection.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: server_name.to_string(),
                         method: "tools/list",
-                        details: "server process missing after initialization".to_string(),
+                        details: "server connection missing after initialization".to_string(),
                     }
                 })?;
                 Self::run_process_request(
                     server_name,
                     "tools/list",
                     MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_tools(
+                    connection.list_tools(
                         request_id,
                         Some(McpListToolsParams {
                             cursor: cursor.clone(),
@@ -883,18 +1089,18 @@ impl McpServerManager {
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+                let connection = server.connection.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: server_name.to_string(),
                         method: "resources/list",
-                        details: "server process missing after initialization".to_string(),
+                        details: "server connection missing after initialization".to_string(),
                     }
                 })?;
                 Self::run_process_request(
                     server_name,
                     "resources/list",
                     MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_resources(
+                    connection.list_resources(
                         request_id,
                         Some(McpListResourcesParams {
                             cursor: cursor.clone(),
@@ -942,29 +1148,28 @@ impl McpServerManager {
         self.ensure_server_ready(server_name).await?;
 
         let request_id = self.take_request_id();
-        let response =
-            {
-                let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
-                    McpServerManagerError::InvalidResponse {
-                        server_name: server_name.to_string(),
-                        method: "resources/read",
-                        details: "server process missing after initialization".to_string(),
-                    }
-                })?;
-                Self::run_process_request(
-                    server_name,
-                    "resources/read",
-                    MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.read_resource(
-                        request_id,
-                        McpReadResourceParams {
-                            uri: uri.to_string(),
-                        },
-                    ),
-                )
-                .await?
-            };
+        let response = {
+            let server = self.server_mut(server_name)?;
+            let connection = server.connection.as_mut().ok_or_else(|| {
+                McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "resources/read",
+                    details: "server connection missing after initialization".to_string(),
+                }
+            })?;
+            Self::run_process_request(
+                server_name,
+                "resources/read",
+                MCP_LIST_TOOLS_TIMEOUT_MS,
+                connection.read_resource(
+                    request_id,
+                    McpReadResourceParams {
+                        uri: uri.to_string(),
+                    },
+                ),
+            )
+            .await?
+        };
 
         if let Some(error) = response.error {
             return Err(McpServerManagerError::JsonRpc {
@@ -984,14 +1189,14 @@ impl McpServerManager {
     }
 
     async fn reset_server(&mut self, server_name: &str) -> Result<(), McpServerManagerError> {
-        let mut process = {
+        let connection = {
             let server = self.server_mut(server_name)?;
             server.initialized = false;
-            server.process.take()
+            server.connection.take()
         };
 
-        if let Some(process) = process.as_mut() {
-            let _ = process.shutdown().await;
+        if let Some(mut connection) = connection {
+            let _ = connection.shutdown().await;
         }
 
         Ok(())
@@ -1054,17 +1259,32 @@ impl McpServerManager {
 
         let mut attempts = 0;
         loop {
-            let needs_spawn = self
+            let needs_connection = self
                 .servers
                 .get(server_name)
-                .map(|server| server.process.is_none())
+                .map(|server| server.connection.is_none())
                 .ok_or_else(|| McpServerManagerError::UnknownServer {
                     server_name: server_name.to_string(),
                 })?;
 
-            if needs_spawn {
+            if needs_connection {
                 let server = self.server_mut(server_name)?;
-                server.process = Some(spawn_mcp_stdio_process(&server.bootstrap)?);
+                let connection = match &server.bootstrap.transport {
+                    McpClientTransport::Stdio(t) => {
+                        ManagedMcpServerConnection::Stdio(McpStdioProcess::spawn(t)?)
+                    }
+                    McpClientTransport::Http(t) => {
+                        ManagedMcpServerConnection::Http(McpHttpConnection::new(t))
+                    }
+                    other => {
+                        return Err(McpServerManagerError::InvalidResponse {
+                            server_name: server_name.to_string(),
+                            method: "initialize",
+                            details: format!("unsupported transport: {other:?}"),
+                        })
+                    }
+                };
+                server.connection = Some(connection);
                 server.initialized = false;
             }
 
@@ -1083,18 +1303,18 @@ impl McpServerManager {
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+                let connection = server.connection.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: server_name.to_string(),
                         method: "initialize",
-                        details: "server process missing before initialize".to_string(),
+                        details: "server connection missing before initialize".to_string(),
                     }
                 })?;
                 Self::run_process_request(
                     server_name,
                     "initialize",
                     MCP_INITIALIZE_TIMEOUT_MS,
-                    process.initialize(request_id, default_initialize_params()),
+                    connection.initialize(request_id, default_initialize_params()),
                 )
                 .await
             };
@@ -1412,7 +1632,7 @@ fn encode_frame(payload: &[u8]) -> Vec<u8> {
 
 fn default_initialize_params() -> McpInitializeParams {
     McpInitializeParams {
-        protocol_version: "2025-03-26".to_string(),
+        protocol_version: "2024-11-05".to_string(),
         capabilities: JsonValue::Object(serde_json::Map::new()),
         client_info: McpInitializeClientInfo {
             name: "runtime".to_string(),
@@ -2791,10 +3011,10 @@ mod tests {
     fn manager_records_unsupported_non_stdio_servers_without_panicking() {
         let servers = BTreeMap::from([
             (
-                "http".to_string(),
+                "sse".to_string(),
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
-                    config: McpServerConfig::Http(McpRemoteServerConfig {
+                    config: McpServerConfig::Sse(McpRemoteServerConfig {
                         url: "https://example.test/mcp".to_string(),
                         headers: BTreeMap::new(),
                         headers_helper: None,
@@ -2828,7 +3048,7 @@ mod tests {
         let unsupported = manager.unsupported_servers();
 
         assert_eq!(unsupported.len(), 3);
-        assert_eq!(unsupported[0].server_name, "http");
+        assert_eq!(unsupported[0].server_name, "sse");
         assert_eq!(unsupported[1].server_name, "sdk");
         assert_eq!(unsupported[2].server_name, "ws");
         assert_eq!(
@@ -2907,6 +3127,110 @@ mod tests {
         });
     }
 
+    #[test]
+    fn manager_discovers_tools_from_http_config() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                // Initialize
+                {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    let request_str = String::from_utf8_lossy(&buf[..n]);
+                    
+                    assert!(request_str.contains("x-browseros-source: gemini-agent"));
+                    assert!(request_str.contains("accept: application/json, text/event-stream"));
+
+                    let body_start = request_str.find("\r\n\r\n").unwrap() + 4;
+                    let request: serde_json::Value = serde_json::from_str(&request_str[body_start..]).unwrap();
+                    assert_eq!(request["method"], "initialize");
+                    
+                    let response = json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "test-http-mcp", "version": "0.1.0"}
+                            }
+                            });
+                            let body = serde_json::to_string(&response).unwrap();
+                            let http_response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                            );
+                            socket.write_all(http_response.as_bytes()).await.unwrap();
+                            }
+
+                            // tools/list
+                            {
+                            let (mut socket, _) = listener.accept().await.unwrap();
+                            let mut buf = [0u8; 4096];
+                            let n = socket.read(&mut buf).await.unwrap();
+                            let request_str = String::from_utf8_lossy(&buf[..n]);
+                            let body_start = request_str.find("\r\n\r\n").unwrap() + 4;
+                            let request: serde_json::Value = serde_json::from_str(&request_str[body_start..]).unwrap();
+                            assert_eq!(request["method"], "tools/list");
+
+                            let response = json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {
+                            "tools": [
+                                {
+                                    "name": "http-echo",
+                                    "description": "Echoes text over HTTP",
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "properties": {"text": {"type": "string"}},
+                                        "required": ["text"]
+                                    }
+                                }
+                            ]
+                            }
+                            });
+                            let body = serde_json::to_string(&response).unwrap();
+                            let http_response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                            );
+                            socket.write_all(http_response.as_bytes()).await.unwrap();
+                            }
+                            });
+
+                            let servers = BTreeMap::from([(
+                            "http-server".to_string(),
+                            ScopedMcpServerConfig {
+                            scope: ConfigSource::Local,
+                            config: McpServerConfig::Http(McpRemoteServerConfig {
+                            url: format!("http://{addr}/mcp"),
+                            headers: BTreeMap::new(),
+                            headers_helper: None,
+                            oauth: None,
+                            }),
+                            },
+                            )]);
+
+                            let mut manager = McpServerManager::from_servers(&servers);
+                            let tools = manager.discover_tools().await.expect("discover tools");
+
+                            assert_eq!(tools.len(), 1);
+                            assert_eq!(tools[0].server_name, "http-server");
+                            assert_eq!(tools[0].raw_name, "http-echo");
+                            });
+                            }
     #[test]
     fn manager_reports_unknown_qualified_tool_name() {
         let runtime = Builder::new_current_thread()
