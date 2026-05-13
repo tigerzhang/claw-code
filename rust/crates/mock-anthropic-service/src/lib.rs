@@ -101,6 +101,7 @@ enum Scenario {
     AutoCompactTriggered,
     TokenCostReporting,
     PlaywrightNavigate,
+    BrowserOsListTabs,
 }
 
 impl Scenario {
@@ -119,6 +120,7 @@ impl Scenario {
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
             "playwright_navigate" => Some(Self::PlaywrightNavigate),
+            "browseros_list_tabs" => Some(Self::BrowserOsListTabs),
             _ => None,
         }
     }
@@ -138,6 +140,7 @@ impl Scenario {
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
             Self::PlaywrightNavigate => "playwright_navigate",
+            Self::BrowserOsListTabs => "browseros_list_tabs",
         }
     }
 }
@@ -470,12 +473,28 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         }
         Scenario::PlaywrightNavigate => match latest_tool_result(request) {
             Some((tool_output, _)) => {
-                final_text_sse(&format!("Playwright navigation complete: {tool_output}"))
+                final_text_sse(&format!(
+                    "Playwright navigation complete: {}",
+                    extract_mcp_text(&tool_output)
+                ))
             }
             None => tool_use_sse(
                 "toolu_playwright_nav",
                 "playwright",
                 &[r#"{"action":"navigate","url":"http://example.com"}"#],
+            ),
+        },
+        Scenario::BrowserOsListTabs => match latest_tool_result(request) {
+            Some((tool_output, _)) => {
+                final_text_sse(&format!(
+                    "BrowserOS list tabs complete: {}",
+                    extract_mcp_text(&tool_output)
+                ))
+            }
+            None => tool_use_sse(
+                "toolu_browseros_tabs",
+                "mcp__browseros__browser_list_tabs",
+                &["{}"],
             ),
         },
     }
@@ -651,13 +670,31 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
         Scenario::PlaywrightNavigate => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_playwright_final",
-                &format!("Playwright navigation complete: {tool_output}"),
+                &format!(
+                    "Playwright navigation complete: {}",
+                    extract_mcp_text(&tool_output)
+                ),
             ),
             None => tool_message_response(
                 "msg_playwright_tool",
                 "toolu_playwright_nav",
                 "playwright",
                 json!({"action": "navigate", "url": "http://example.com"}),
+            ),
+        },
+        Scenario::BrowserOsListTabs => match latest_tool_result(request) {
+            Some((tool_output, _)) => text_message_response(
+                "msg_browseros_final",
+                &format!(
+                    "BrowserOS list tabs complete: {}",
+                    extract_mcp_text(&tool_output)
+                ),
+            ),
+            None => tool_message_response(
+                "msg_browseros_tool",
+                "toolu_browseros_tabs",
+                "mcp__browseros__browser_list_tabs",
+                json!({}),
             ),
         },
     }
@@ -678,6 +715,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
         Scenario::PlaywrightNavigate => "req_playwright_navigate",
+        Scenario::BrowserOsListTabs => "req_browseros_list_tabs",
     }
 }
 
@@ -1143,6 +1181,21 @@ fn extract_plugin_message(tool_output: &str) -> String {
             value
                 .get("input")
                 .and_then(|input| input.get("message"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| tool_output.trim().to_string())
+}
+
+fn extract_mcp_text(tool_output: &str) -> String {
+    serde_json::from_str::<Value>(tool_output)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|block| block.get("text"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })

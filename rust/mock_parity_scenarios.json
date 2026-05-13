@@ -105,5 +105,21 @@
     "parity_refs": [
       "Token counting / cost tracking accuracy"
     ]
+  },
+  {
+    "name": "playwright_navigate",
+    "category": "mcp-browser",
+    "description": "Exercises Playwright MCP tool execution for browser navigation.",
+    "parity_refs": [
+      "Playwright MCP integration"
+    ]
+  },
+  {
+    "name": "browseros_list_tabs",
+    "category": "mcp-browser",
+    "description": "Exercises BrowserOS MCP tool execution over HTTP/SSE.",
+    "parity_refs": [
+      "BrowserOS MCP integration"
+    ]
   }
 ]
