@@ -91,6 +91,7 @@ Primary artifacts:
 | Config file hierarchy (`.claw.json` + merged config sections) | ✅ |
 | Permission system | ✅ |
 | MCP server lifecycle + inspection | ✅ |
+| BrowserOS integration (HTTP/SSE transport) | ✅ |
 | Session persistence + resume | ✅ |
 | Cost / usage / stats surfaces | ✅ |
 | Git integration | ✅ |
