@@ -12,6 +12,7 @@ pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
+    Base,
     User,
     Project,
     Local,
@@ -93,9 +94,34 @@ pub struct RuntimePermissionRuleConfig {
 }
 
 /// Collection of configured MCP servers after scope-aware merging.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpConfigCollection {
     servers: BTreeMap<String, ScopedMcpServerConfig>,
+}
+
+impl Default for McpConfigCollection {
+    fn default() -> Self {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "playwright".to_string(),
+            ScopedMcpServerConfig {
+                scope: ConfigSource::Base,
+                config: McpServerConfig::Stdio(McpStdioServerConfig {
+                    command: "npx".to_string(),
+                    args: vec![
+                        "-y".to_string(),
+                        "@playwright/mcp@latest".to_string(),
+                        "--headless".to_string(),
+                        "--browser".to_string(),
+                        "chromium".to_string(),
+                    ],
+                    env: BTreeMap::new(),
+                    tool_call_timeout_ms: Some(60_000),
+                }),
+            },
+        );
+        Self { servers }
+    }
 }
 
 /// MCP server config paired with the scope that defined it.
@@ -269,9 +295,9 @@ impl ConfigLoader {
     }
 
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
-        let mut merged = BTreeMap::new();
+        let mut mcp_servers = McpConfigCollection::default().servers;
         let mut loaded_entries = Vec::new();
-        let mut mcp_servers = BTreeMap::new();
+        let mut merged = BTreeMap::new();
         let mut all_warnings = Vec::new();
 
         for entry in self.discover() {
@@ -1272,8 +1298,8 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigLoader, ConfigSource,
-        McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        McpConfigCollection, McpServerConfig, McpTransport, ResolvedPermissionMode,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -2159,6 +2185,24 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn includes_builtin_playwright_server_by_default() {
+        let collection = McpConfigCollection::default();
+        let playwright = collection
+            .get("playwright")
+            .expect("should have playwright server");
+        assert_eq!(playwright.scope, ConfigSource::Base);
+
+        match &playwright.config {
+            McpServerConfig::Stdio(stdio) => {
+                assert_eq!(stdio.command, "npx");
+                assert!(stdio.args.contains(&"@playwright/mcp@latest".to_string()));
+                assert!(stdio.args.contains(&"--headless".to_string()));
+            }
+            _ => panic!("expected stdio server"),
+        }
     }
 
     #[test]

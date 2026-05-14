@@ -247,25 +247,25 @@ fn invalid_params_response(id: JsonRpcId, message: &str) -> JsonRpcResponse<Json
 /// Returns `Ok(None)` on clean EOF before any header bytes have been read,
 /// matching how [`crate::mcp_stdio::McpStdioProcess`] treats stream closure.
 async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>> {
+    let mut line = String::new();
+    let bytes_read = reader.read_line(&mut line).await?;
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+
+    if !line.to_ascii_lowercase().starts_with("content-length:") {
+        // Assume newline-delimited JSON
+        return Ok(Some(line.into_bytes()));
+    }
+
+    // LSP framing
     let mut content_length: Option<usize> = None;
-    let mut first_header = true;
+    let mut current_line = line;
     loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            if first_header {
-                return Ok(None);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "MCP stdio stream closed while reading headers",
-            ));
-        }
-        first_header = false;
-        if line == "\r\n" || line == "\n" {
+        let header = current_line.trim_end_matches(['\r', '\n']);
+        if header.is_empty() {
             break;
         }
-        let header = line.trim_end_matches(['\r', '\n']);
         if let Some((name, value)) = header.split_once(':') {
             if name.trim().eq_ignore_ascii_case("Content-Length") {
                 let parsed = value
@@ -274,6 +274,15 @@ async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 content_length = Some(parsed);
             }
+        }
+
+        current_line = String::new();
+        let bytes_read = reader.read_line(&mut current_line).await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MCP stdio stream closed while reading headers",
+            ));
         }
     }
 
@@ -291,9 +300,9 @@ async fn write_response(
 ) -> io::Result<()> {
     let body = serde_json::to_vec(response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    stdout.write_all(header.as_bytes()).await?;
-    stdout.write_all(&body).await?;
+    let mut framed = body;
+    framed.push(b'\n');
+    stdout.write_all(&framed).await?;
     stdout.flush().await
 }
 

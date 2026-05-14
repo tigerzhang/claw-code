@@ -148,6 +148,26 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             extra_env: None,
             resume_session: None,
         },
+        ScenarioCase {
+            name: "playwright_navigate",
+            permission_mode: "danger-full-access",
+            allowed_tools: Some("playwright"),
+            stdin: None,
+            prepare: prepare_playwright_fixture,
+            assert: assert_playwright_navigate,
+            extra_env: None,
+            resume_session: None,
+        },
+        ScenarioCase {
+            name: "browseros_list_tabs",
+            permission_mode: "read-only",
+            allowed_tools: None, // Will use MCP prefix
+            stdin: None,
+            prepare: prepare_browseros_fixture,
+            assert: assert_browseros_list_tabs,
+            extra_env: None,
+            resume_session: None,
+        },
     ];
 
     let case_names = cases.iter().map(|case| case.name).collect::<Vec<_>>();
@@ -163,12 +183,17 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
     let mut scenario_reports = Vec::new();
 
     for case in cases {
+        println!(">>> START SCENARIO: {}", case.name);
         let workspace = HarnessWorkspace::new(unique_temp_dir(case.name));
         workspace.create().expect("workspace should exist");
+        println!("    Setup workspace: {}", workspace.root.display());
         (case.prepare)(&workspace);
+        println!("    Preparation complete.");
 
         let run = run_case(case, &workspace, &base_url);
+        println!("    CLI finished. Asserting results...");
         (case.assert)(&workspace, &run);
+        println!("<<< END SCENARIO: {} - PASSED", case.name);
 
         let manifest_entry = manifest
             .get(case.name)
@@ -194,8 +219,8 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
         .collect();
     assert_eq!(
         messages_only.len(),
-        21,
-        "twelve scenarios should produce twenty-one /v1/messages requests (total captured: {}, includes count_tokens)",
+        25,
+        "fourteen scenarios should produce twenty-five /v1/messages requests (total captured: {}, includes count_tokens)",
         captured.len()
     );
     assert!(messages_only.iter().all(|request| request.stream));
@@ -228,6 +253,10 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             "plugin_tool_roundtrip",
             "auto_compact_triggered",
             "token_cost_reporting",
+            "playwright_navigate",
+            "playwright_navigate",
+            "browseros_list_tabs",
+            "browseros_list_tabs",
         ]
     );
 
@@ -308,6 +337,7 @@ struct ScenarioReport {
 }
 
 fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) -> ScenarioRun {
+    println!("  RUNNING CLI for scenario: {}", case.name);
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command
         .current_dir(&workspace.root)
@@ -340,6 +370,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     command.arg(prompt);
 
     let output = if let Some(stdin) = case.stdin {
+        println!("    Spawning CLI with stdin: {:?}", stdin);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -354,9 +385,11 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
             .expect("stdin should write");
         child.wait_with_output().expect("claw should finish")
     } else {
+        println!("    Executing CLI...");
         command.output().expect("claw should launch")
     };
 
+    println!("    CLI exit status: {}", output.status);
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     ScenarioRun {
@@ -739,6 +772,145 @@ fn assert_token_cost_reporting(_: &HarnessWorkspace, run: &ScenarioRun) {
             .is_some_and(|cost| cost.starts_with('$')),
         "estimated_cost should be a dollar-prefixed string"
     );
+}
+
+fn prepare_playwright_fixture(workspace: &HarnessWorkspace) {
+    println!("    Preparing Playwright fixture...");
+    let script_path = workspace.root.join("mock-playwright.py");
+    fs::write(
+        &script_path,
+        r#"
+import sys
+import json
+
+def respond(id, result):
+    print(json.dumps({"jsonrpc": "2.0", "id": id, "result": result}), flush=True)
+
+for line in sys.stdin:
+    if not line.strip(): continue
+    try:
+        req = json.loads(line)
+    except:
+        continue
+    method = req.get("method")
+    req_id = req.get("id")
+    
+    if method == "initialize":
+        respond(req_id, {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "mock-playwright", "version": "0.1.0"}})
+    elif method == "tools/list":
+        respond(req_id, {"tools": [{"name": "browser_navigate", "description": "navigate", "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}}} ]})
+    elif method == "tools/call":
+        respond(req_id, {"content": [{"type": "text", "text": "Navigated to http://example.com"}]})
+    elif method == "notifications/initialized":
+        pass
+"#,
+    ).expect("mock script write");
+
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        json!({
+            "mcpServers": {
+                "playwright": {
+                    "command": "python3",
+                    "args": [script_path.display().to_string()]
+                }
+            }
+        }).to_string()
+    ).expect("settings write");
+}
+
+fn assert_playwright_navigate(_: &HarnessWorkspace, run: &ScenarioRun) {
+    println!("    Asserting Playwright navigate...");
+    assert_eq!(run.response["iterations"], Value::from(2));
+    assert_eq!(
+        run.response["tool_uses"][0]["name"],
+        Value::String("playwright".to_string())
+    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("Playwright navigation complete: Navigated to http://example.com"));
+}
+
+fn prepare_browseros_fixture(workspace: &HarnessWorkspace) {
+    println!("    Preparing BrowserOS fixture...");
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind to ephemeral port");
+        let port = listener.local_addr().expect("failed to get local addr").port();
+        println!("    Selected ephemeral port: {}", port);
+        port
+    };
+    let script_path = workspace.root.join("mock-browseros.py");
+    println!("    Mock script path: {}", script_path.display());
+    
+    fs::write(
+        &script_path,
+        format!(r#"
+import http.server
+import json
+import sys
+
+class MockHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_length = int(self.headers['Content-Length'])
+        body = self.rfile.read(content_length)
+        req = json.loads(body)
+        method = req.get("method")
+        req_id = req.get("id")
+        
+        result = {{}}
+        if method == "initialize":
+            result = {{"protocolVersion": "2024-11-05", "capabilities": {{"tools": {{}}}}, "serverInfo": {{"name": "mock-browseros", "version": "0.1.0"}}}}
+        elif method == "tools/list":
+            result = {{"tools": [{{"name": "browser_list_tabs", "description": "list tabs", "inputSchema": {{"type": "object", "properties": {{}}}}, "annotations": {{"readOnlyHint": True}} }}]}}
+        elif method == "tools/call":
+            result = {{"content": [{{"type": "text", "text": "Tabs: [Google, Example]"}}]}}
+            
+        response = {{"jsonrpc": "2.0", "id": req_id, "result": result}}
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode())
+
+    def log_message(self, format, *args):
+        return
+
+http.server.HTTPServer(('127.0.0.1', {port}), MockHandler).serve_forever()
+"#)
+    ).expect("mock script write");
+
+    Command::new("python3")
+        .arg(&script_path)
+        .spawn()
+        .expect("failed to start mock browseros server");
+    println!("    Mock BrowserOS server started.");
+    
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        json!({
+            "mcpServers": {
+                "browseros": {
+                    "type": "http",
+                    "url": format!("http://127.0.0.1:{}/mcp", port)
+                }
+            }
+        }).to_string()
+    ).expect("settings write");
+}
+
+fn assert_browseros_list_tabs(_: &HarnessWorkspace, run: &ScenarioRun) {
+    println!("    Asserting BrowserOS list tabs...");
+    assert_eq!(run.response["iterations"], Value::from(2));
+    assert_eq!(
+        run.response["tool_uses"][0]["name"],
+        Value::String("mcp__browseros__browser_list_tabs".to_string())
+    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("BrowserOS list tabs complete: Tabs: [Google, Example]"));
 }
 
 fn parse_json_output(stdout: &str) -> Value {

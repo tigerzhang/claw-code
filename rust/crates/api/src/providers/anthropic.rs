@@ -17,7 +17,8 @@ use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
-    anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
+    anthropic_missing_credentials, model_token_limit, resolve_model_alias, strip_routing_prefix,
+    Provider, ProviderFuture,
 };
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
@@ -468,7 +469,9 @@ impl AnthropicClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let mut request_body = self.request_profile.render_json_body(request)?;
+        let mut request = request.clone();
+        request.model = strip_routing_prefix(&request.model).to_string();
+        let mut request_body = self.request_profile.render_json_body(&request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
@@ -529,7 +532,9 @@ impl AnthropicClient {
             "{}/v1/messages/count_tokens",
             self.base_url.trim_end_matches('/')
         );
-        let mut request_body = self.request_profile.render_json_body(request)?;
+        let mut request = request.clone();
+        request.model = strip_routing_prefix(&request.model).to_string();
+        let mut request_body = self.request_profile.render_json_body(&request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
         let response = self
             .build_request(&request_url)
@@ -1549,6 +1554,17 @@ mod tests {
             rendered.get("model").and_then(serde_json::Value::as_str),
             Some("claude-sonnet-4-6")
         );
+    }
+
+    #[tokio::test]
+    async fn send_raw_request_strips_routing_prefix() {
+        // This test doesn't actually send a request but we can verify the logic
+        // if we mock the client. However, AnthropicClient doesn't easily allow
+        // mocking the http client for this check without more refactoring.
+        // Instead, we can verify that strip_routing_prefix works as expected.
+        assert_eq!(super::strip_routing_prefix("anthropic/claude-opus"), "claude-opus");
+        assert_eq!(super::strip_routing_prefix("openai/gpt-4"), "gpt-4");
+        assert_eq!(super::strip_routing_prefix("claude-opus"), "claude-opus");
     }
 
     #[test]

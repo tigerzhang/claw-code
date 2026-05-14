@@ -216,7 +216,38 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // Anthropic-prefixed models. Routes anthropic/* to the Anthropic provider.
+    if canonical.starts_with("anthropic/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::Anthropic,
+            auth_env: "ANTHROPIC_API_KEY",
+            base_url_env: "ANTHROPIC_BASE_URL",
+            default_base_url: anthropic::DEFAULT_BASE_URL,
+        });
+    }
     None
+}
+
+/// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
+/// The prefix is used only to select transport; the backend expects the
+/// bare model id.
+#[must_use]
+pub fn strip_routing_prefix(model: &str) -> &str {
+    if let Some(pos) = model.find('/') {
+        let prefix = &model[..pos];
+        // Only strip if the prefix before "/" is a known routing prefix,
+        // not if "/" appears in the middle of the model name for other reasons.
+        if matches!(
+            prefix,
+            "openai" | "anthropic" | "xai" | "grok" | "qwen" | "kimi"
+        ) {
+            &model[pos + 1..]
+        } else {
+            model
+        }
+    } else {
+        model
+    }
 }
 
 #[must_use]
@@ -495,10 +526,11 @@ mod tests {
     };
 
     use super::{
-        anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
-        load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_family_identity_for, model_family_identity_for_kind, model_token_limit, parse_dotenv,
-        preflight_message_request, resolve_model_alias, ProviderKind,
+        anthropic, anthropic_missing_credentials, anthropic_missing_credentials_hint,
+        detect_provider_kind, load_dotenv_file, max_tokens_for_model,
+        max_tokens_for_model_with_override, model_family_identity_for,
+        model_family_identity_for_kind, model_token_limit, parse_dotenv, preflight_message_request,
+        resolve_model_alias, ProviderKind,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -613,6 +645,29 @@ mod tests {
         let kind2 = super::metadata_for_model("gpt-4o")
             .map_or_else(|| detect_provider_kind("gpt-4o"), |m| m.provider);
         assert_eq!(kind2, ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn anthropic_prefix_routes_to_anthropic_provider() {
+        let meta = super::metadata_for_model("anthropic/claude-3-5-sonnet")
+            .expect("anthropic/ prefix must resolve to Anthropic metadata");
+        assert_eq!(meta.provider, ProviderKind::Anthropic);
+        assert_eq!(meta.auth_env, "ANTHROPIC_API_KEY");
+        assert_eq!(meta.base_url_env, "ANTHROPIC_BASE_URL");
+        assert_eq!(meta.default_base_url, anthropic::DEFAULT_BASE_URL);
+
+        let kind = detect_provider_kind("anthropic/custom-model");
+        assert_eq!(kind, ProviderKind::Anthropic);
+    }
+
+    #[test]
+    fn strip_routing_prefix_handles_all_supported_providers() {
+        assert_eq!(super::strip_routing_prefix("openai/gpt-4"), "gpt-4");
+        assert_eq!(super::strip_routing_prefix("anthropic/claude-3"), "claude-3");
+        assert_eq!(super::strip_routing_prefix("xai/grok"), "grok");
+        assert_eq!(super::strip_routing_prefix("qwen/qwen-plus"), "qwen-plus");
+        assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
+        assert_eq!(super::strip_routing_prefix("custom/model"), "custom/model");
     }
 
     #[test]

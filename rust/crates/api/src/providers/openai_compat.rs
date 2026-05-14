@@ -14,7 +14,7 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{preflight_message_request, Provider, ProviderFuture};
+use super::{preflight_message_request, strip_routing_prefix, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -862,24 +862,6 @@ pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
     canonical.starts_with("deepseek-v4")
-}
-
-/// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
-/// The prefix is used only to select transport; the backend expects the
-/// bare model id.
-fn strip_routing_prefix(model: &str) -> &str {
-    if let Some(pos) = model.find('/') {
-        let prefix = &model[..pos];
-        // Only strip if the prefix before "/" is a known routing prefix,
-        // not if "/" appears in the middle of the model name for other reasons.
-        if matches!(prefix, "openai" | "xai" | "grok" | "qwen" | "kimi") {
-            &model[pos + 1..]
-        } else {
-            model
-        }
-    } else {
-        model
-    }
 }
 
 /// Estimate the serialized JSON size of a request payload in bytes.

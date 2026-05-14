@@ -40,6 +40,10 @@ pub enum AssistantEvent {
     },
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
+    Error {
+        error_type: String,
+        message: String,
+    },
     MessageStop,
 }
 
@@ -744,6 +748,15 @@ fn build_assistant_message(
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
             AssistantEvent::MessageStop => {
                 finished = true;
+            }
+            AssistantEvent::Error {
+                error_type,
+                message,
+            } => {
+                return Err(RuntimeError::new(format!(
+                    "provider error: {} ({})",
+                    message, error_type
+                )));
             }
         }
     }

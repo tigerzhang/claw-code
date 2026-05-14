@@ -4410,6 +4410,7 @@ impl RuntimeMcpState {
 
         let runtime = tokio::runtime::Runtime::new()?;
         let discovery = runtime.block_on(manager.discover_tools_best_effort());
+
         let pending_servers = discovery
             .failed_servers
             .iter()
@@ -4600,11 +4601,57 @@ fn build_runtime_mcp_state(
         .iter()
         .map(mcp_runtime_tool_definition)
         .collect::<Vec<_>>();
+    
+    // Add built-in high-level playwright tool
+    runtime_tools.push(playwright_tool_definition());
+
     if !mcp_state.server_names().is_empty() {
         runtime_tools.extend(mcp_wrapper_tool_definitions());
     }
 
     Ok((Some(Arc::new(Mutex::new(mcp_state))), runtime_tools))
+}
+
+fn playwright_tool_definition() -> RuntimeToolDefinition {
+    RuntimeToolDefinition {
+        name: "playwright".to_string(),
+        description: Some("Interact with a web browser using Playwright. Supports actions like navigate, click, fill, evaluate, screenshot, and more.".to_string()),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "navigate",
+                        "screenshot",
+                        "click",
+                        "fill",
+                        "select_option",
+                        "hover",
+                        "focus",
+                        "key_press",
+                        "scroll",
+                        "drag_and_drop",
+                        "evaluate"
+                    ]
+                },
+                "url": { "type": "string" },
+                "selector": { "type": "string" },
+                "text": { "type": "string" },
+                "value": { "type": "string" },
+                "script": { "type": "string" },
+                "key": { "type": "string" },
+                "timeout": { "type": "integer", "minimum": 0 },
+                "x": { "type": "integer" },
+                "y": { "type": "integer" },
+                "width": { "type": "integer" },
+                "height": { "type": "integer" }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
+        required_permission: runtime::PermissionMode::DangerFullAccess,
+    }
 }
 
 fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -6679,6 +6726,7 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
     ];
     for entry in discovered {
         let source = match entry.source {
+            ConfigSource::Base => "builtin",
             ConfigSource::User => "user",
             ConfigSource::Project => "project",
             ConfigSource::Local => "local",
@@ -6756,6 +6804,7 @@ fn render_config_json(
         .iter()
         .map(|e| {
             let source = match e.source {
+                ConfigSource::Base => "builtin",
                 ConfigSource::User => "user",
                 ConfigSource::Project => "project",
                 ConfigSource::Local => "local",
@@ -8495,6 +8544,9 @@ impl AnthropicRuntimeClient {
                     }
                     events.push(AssistantEvent::MessageStop);
                 }
+                ApiStreamEvent::Error(error) => {
+                    return Err(RuntimeError::new(error.error.message));
+                }
             }
         }
 
@@ -9529,6 +9581,32 @@ impl CliToolExecutor {
                 let input: ReadMcpResourceRequest = serde_json::from_value(value)
                     .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
                 mcp_state.read_resource(&input.server, &input.uri)
+            }
+            "playwright" => {
+                let action = value
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ToolError::new("missing required field `action`"))?;
+                let mut arguments = value.clone();
+                if let Some(obj) = arguments.as_object_mut() {
+                    obj.remove("action");
+                }
+                
+                let tool_name = match action {
+                    "navigate" => "browser_navigate",
+                    "screenshot" => "browser_take_screenshot",
+                    "click" => "browser_click",
+                    "fill" => "browser_fill_form",
+                    "select_option" => "browser_select_option",
+                    "hover" => "browser_hover",
+                    "key_press" => "browser_press_key",
+                    "drag_and_drop" => "browser_drag",
+                    "evaluate" => "browser_evaluate",
+                    other => other,
+                };
+                
+                let qualified_name = runtime::mcp_tool_name("playwright", tool_name);
+                mcp_state.call_tool(&qualified_name, Some(arguments))
             }
             _ => mcp_state.call_tool(tool_name, Some(value)),
         }
